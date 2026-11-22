@@ -222,11 +222,8 @@ public abstract class PipeBlock extends Block implements IItemBlock, SimpleWater
                 setHasData(world, pos, false);
             }
         }
-        BlockState blockState = world.getBlockState(pos);
-        BooleanProperty sideProperty = getProperty(side);
-        boolean connected = blockState.getValue(sideProperty);
-        world.setBlockAndUpdate(pos, blockState.setValue(sideProperty, !connected));
-        world.setBlockAndUpdate(pos, blockState.setValue(sideProperty, connected));
+        BlockState currentState = world.getBlockState(pos);
+        world.sendBlockUpdated(pos, currentState, currentState, 2);
     }
 
     public void setDisconnected(Level world, BlockPos pos, Direction side, boolean disconnected) {
@@ -315,8 +312,17 @@ public abstract class PipeBlock extends Block implements IItemBlock, SimpleWater
     public void neighborChanged(BlockState state, Level world, BlockPos pos, Block block, BlockPos pos1, boolean b) {
         super.neighborChanged(state, world, pos, block, pos1, b);
         BlockState newState = getState(world, pos, state);
-        if (!state.getProperties().stream().allMatch(property -> state.getValue(property).equals(newState.getValue(property)))) {
-            world.setBlockAndUpdate(pos, newState);
+        if (state.equals(newState)) {
+            return;
+        }
+        boolean connectionChanged = state.getValue(UP) != newState.getValue(UP)
+                || state.getValue(DOWN) != newState.getValue(DOWN)
+                || state.getValue(NORTH) != newState.getValue(NORTH)
+                || state.getValue(SOUTH) != newState.getValue(SOUTH)
+                || state.getValue(EAST) != newState.getValue(EAST)
+                || state.getValue(WEST) != newState.getValue(WEST);
+        world.setBlockAndUpdate(pos, newState);
+        if (connectionChanged) {
             PipeTileEntity.markPipesDirty(world, pos);
         }
     }

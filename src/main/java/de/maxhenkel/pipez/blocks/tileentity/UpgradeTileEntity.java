@@ -23,8 +23,9 @@ import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.IdentityHashMap;
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.Map;
 
 public abstract class UpgradeTileEntity extends PipeTileEntity implements Clearable {
 
@@ -144,20 +145,45 @@ public abstract class UpgradeTileEntity extends PipeTileEntity implements Cleara
         upgradeInventory.clear();
     }
 
+    @Nullable
+    private List<PipeTileEntity.Connection> lastSortedConnections;
+    @SuppressWarnings("unchecked")
+    private final Map<PipeType<?, ?>, List<PipeTileEntity.Connection>[]> sortedConnectionsCache = new IdentityHashMap<>();
+
+    /**
+     * 按连接列表身份失效、按方向/管道类型/分配模式缓存的排序连接
+     */
     public List<PipeTileEntity.Connection> getSortedConnections(Direction side, PipeType pipeType) {
-        UpgradeTileEntity.Distribution distribution = getDistribution(side, pipeType);
-        switch (distribution) {
-            case FURTHEST:
-                return getConnections().stream().sorted((o1, o2) -> Integer.compare(o2.getDistance(), o1.getDistance())).collect(Collectors.toList());
-            case RANDOM:
-                ArrayList<PipeTileEntity.Connection> shuffle = new ArrayList<>(getConnections());
-                Collections.shuffle(shuffle);
-                return shuffle;
-            case NEAREST:
-            case ROUND_ROBIN:
-            default:
-                return getConnections().stream().sorted(Comparator.comparingInt(PipeTileEntity.Connection::getDistance)).collect(Collectors.toList());
+        List<PipeTileEntity.Connection> currentConnections = getConnections();
+        if (currentConnections.isEmpty()) {
+            return currentConnections;
         }
+        UpgradeTileEntity.Distribution distribution = getDistribution(side, pipeType);
+        if (distribution == UpgradeTileEntity.Distribution.RANDOM) {
+            ArrayList<PipeTileEntity.Connection> shuffle = new ArrayList<>(currentConnections);
+            Collections.shuffle(shuffle);
+            return shuffle;
+        }
+        if (currentConnections != lastSortedConnections) {
+            sortedConnectionsCache.clear();
+            lastSortedConnections = currentConnections;
+        }
+        List<PipeTileEntity.Connection>[] cached = sortedConnectionsCache.get(pipeType);
+        if (cached == null) {
+            cached = new List[Direction.values().length * Distribution.values().length];
+            sortedConnectionsCache.put(pipeType, cached);
+        }
+        int index = side.get3DDataValue() * Distribution.values().length + distribution.ordinal();
+        List<PipeTileEntity.Connection> sorted = cached[index];
+        if (sorted == null) {
+            sorted = new ArrayList<>(currentConnections);
+            Comparator<PipeTileEntity.Connection> comparator = distribution == UpgradeTileEntity.Distribution.FURTHEST
+                    ? Comparator.comparingInt(PipeTileEntity.Connection::getDistance).reversed()
+                    : Comparator.comparingInt(PipeTileEntity.Connection::getDistance);
+            sorted.sort(comparator);
+            cached[index] = sorted;
+        }
+        return sorted;
     }
 
     public enum Distribution implements ICyclable<Distribution> {

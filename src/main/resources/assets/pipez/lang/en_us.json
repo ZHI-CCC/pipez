@@ -81,5 +81,20 @@
   "message.pipez.filter.destination": "Destination",
   "message.pipez.filter_destination_tool.destination": "Destination: %s, %s, %s, %s",
   "message.pipez.filter_destination_tool.destination.any": "Destination: Any",
-  "message.pipez.filter_destination_tool.destination.set": "Destination set"
+  "message.pipez.filter_destination_tool.destination.set": "Destination set",
+  "tooltip.pipez.transfer_rate.item.prefix": "[Item Pipe]",
+  "tooltip.pipez.transfer_rate.item": "%1$s Items / %2$s Tick",
+  "tooltip.pipez.transfer_rate.fluid.prefix": "[Fluid Pipe]",
+  "tooltip.pipez.transfer_rate.fluid": "%1$s mB / %2$s Tick",
+  "tooltip.pipez.transfer_rate.energy.prefix": "[Energy Pipe]",
+  "tooltip.pipez.transfer_rate.energy": "%1$s FE / %2$s Tick",
+  "tooltip.pipez.transfer_rate.gas.prefix": "[Gas Pipe]",
+  "tooltip.pipez.transfer_rate.gas": "%1$s mB / %2$s Tick",
+  "tooltip.pipez.hold_shift": "§8Hold §e[Shift] §8for exact numbers",
+  "gui.pipez.extract_freq": "Extract Freq:",
+  "gui.pipez.smart_sleep": "Smart Sleep",
+  "tooltip.pipez.smart_sleep": "§a[Smart Sleep]§r\nWhen enabled, pipes automatically sleep when there is nothing to transfer.\n§cWhen disabled§r, this connection never sleeps: it retries at exactly the set frequency with no backoff (set frequency to 1 for every tick).",
+  "gui.pipez.transfer_correction": "Transfer Correction",
+  "tooltip.pipez.transfer_correction": "§c[Transfer Correction]§r\nForces the transfer rate to approach the theoretical maximum, looping up to §e1000 times§r per tick.\n§8Only enable this if connected to certain modded containers that cause extremely slow transfers.\n§8Keep disabled if working normally to prevent lag.",
+  "config.jade.plugin_pipez.pipe": "Pipez"
 }

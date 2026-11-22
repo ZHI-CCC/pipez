@@ -56,6 +56,41 @@ public abstract class PipeType<T, D extends AbstractPipeTypeData<T>> {
         return UpgradeTileEntity.FilterMode.WHITELIST;
     }
 
+    /**
+     * 无自定义频率时使用的原生抽取频率（tick），物品管道为升级对应的抽取间隔
+     */
+    public int getDefaultFrequency(@Nullable Upgrade upgrade) {
+        return 1;
+    }
+
+    /**
+     * 是否允许对该管道类型设置自定义抽取频率
+     */
+    public boolean isCustomFrequencyEnabled() {
+        return true;
+    }
+
+    /**
+     * 智能休眠的单次最大休眠时长（tick），0 表示该类型不休眠
+     */
+    public int getMaxSleepTicks() {
+        return 40;
+    }
+
+    /**
+     * 是否支持传输修正
+     */
+    public boolean supportsTransferCorrection() {
+        return true;
+    }
+
+    /**
+     * 速率提示文本的翻译键
+     */
+    public String getRateTranslationKey() {
+        return "tooltip.pipez.transfer_rate";
+    }
+
     public int getRate(PipeLogicTileEntity tileEntity, Direction direction) {
         return getRate(tileEntity.getUpgrade(direction));
     }

@@ -7,24 +7,21 @@ import de.maxhenkel.pipez.blocks.tileentity.PipeTileEntity;
 import de.maxhenkel.pipez.blocks.tileentity.UpgradeTileEntity;
 import de.maxhenkel.pipez.datacomponents.FluidData;
 import de.maxhenkel.pipez.items.ModItems;
-import de.maxhenkel.pipez.utils.ComponentUtils;
+import de.maxhenkel.pipez.utils.FilterMatcher;
 import net.minecraft.core.Direction;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.core.component.DataComponentType;
-import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.material.Fluid;
 import net.neoforged.neoforge.capabilities.BlockCapability;
 import net.neoforged.neoforge.capabilities.Capabilities;
 import net.neoforged.neoforge.fluids.FluidStack;
-import net.neoforged.neoforge.fluids.FluidUtil;
 import net.neoforged.neoforge.fluids.capability.IFluidHandler;
 
 import javax.annotation.Nullable;
 import java.util.Collections;
 import java.util.List;
-import java.util.stream.Collectors;
 
 public class FluidPipeType extends PipeType<Fluid, FluidData> {
 
@@ -44,6 +41,11 @@ public class FluidPipeType extends PipeType<Fluid, FluidData> {
     @Override
     public String getTranslationKey() {
         return "tooltip.pipez.fluid";
+    }
+
+    @Override
+    public String getRateTranslationKey() {
+        return "tooltip.pipez.transfer_rate.fluid";
     }
 
     @Override
@@ -85,124 +87,228 @@ public class FluidPipeType extends PipeType<Fluid, FluidData> {
     }
 
     protected void insertEqually(PipeLogicTileEntity tileEntity, Direction side, List<PipeTileEntity.Connection> connections, IFluidHandler fluidHandler) {
-        if (connections.isEmpty()) {
+        int pipeIndex = tileEntity.getIndex(this);
+        int targetCount = connections.size();
+        if (targetCount == 0) {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
             return;
         }
-        int completeAmount = getRate(tileEntity, side);
-        int mbToTransfer = completeAmount;
-        boolean[] connectionsFull = new boolean[connections.size()];
-        int p = tileEntity.getRoundRobinIndex(side, this) % connections.size();
-        while (mbToTransfer > 0 && hasNotInserted(connectionsFull)) {
-            PipeTileEntity.Connection connection = connections.get(p);
-            IFluidHandler destination = connection.getFluidHandler();
-            boolean hasInserted = false;
-            if (destination != null && !connectionsFull[p]) {
-                for (int j = 0; j < fluidHandler.getTanks(); j++) {
-                    FluidStack fluidInTank = fluidHandler.getFluidInTank(j);
-                    FluidStack copy = fluidInTank.copy();
-                    copy.setAmount(Math.min(Math.max(completeAmount / getConnectionsNotFullCount(connectionsFull), 1), mbToTransfer));
-                    FluidStack simulatedExtract = fluidHandler.drain(copy, IFluidHandler.FluidAction.SIMULATE);
-                    if (simulatedExtract.isEmpty()) {
+        int mbToTransfer = getRate(tileEntity, side);
+        if (mbToTransfer <= 0) {
+            return;
+        }
+        int initialTransfer = mbToTransfer;
+        int totalTanks = fluidHandler.getTanks();
+        if (totalTanks <= 0) {
+            return;
+        }
+        List<Filter<?, ?>> filters = tileEntity.getFilters(side, this);
+        boolean isBlacklist = tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST);
+        HolderLookup.Provider provider = tileEntity.getLevel().registryAccess();
+        boolean isCorrectionEnabled = tileEntity.isTransferCorrectionEnabled(side, pipeIndex);
+        boolean[] connectionsFull = new boolean[targetCount];
+        IFluidHandler[] validHandlers = new IFluidHandler[targetCount];
+        PipeTileEntity.Connection[] validConnections = new PipeTileEntity.Connection[targetCount];
+        boolean sleepEnabled = getMaxSleepTicks() > 0;
+        int startTank = tileEntity.getLastSlot(side, pipeIndex) % totalTanks;
+        boolean keepTrying = true;
+        int loopCount = 0;
+        while (keepTrying && mbToTransfer > 0 && ++loopCount <= 1000) {
+            boolean madeProgressThisPass = false;
+            int scanned = 0;
+            while (scanned < totalTanks && mbToTransfer > 0) {
+                int currentTank = (startTank + scanned) % totalTanks;
+                FluidStack simulatedExtract = simulateDrain(fluidHandler, currentTank, mbToTransfer);
+                if (simulatedExtract.isEmpty()) {
+                    scanned++;
+                    continue;
+                }
+                int validTargets = 0;
+                for (int j = 0; j < targetCount; j++) {
+                    if (connectionsFull[j]) {
                         continue;
                     }
-                    if (canInsert(tileEntity.getLevel().registryAccess(), connection, simulatedExtract, tileEntity.getFilters(side, this)) == tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST)) {
+                    PipeTileEntity.Connection connection = connections.get(j);
+                    if (sleepEnabled && !tileEntity.isDestinationAwake(side, connection.getPos(), pipeIndex)) {
                         continue;
                     }
-                    FluidStack stack = FluidUtil.tryFluidTransfer(destination, fluidHandler, simulatedExtract, true);
-                    if (stack.getAmount() > 0) {
-                        mbToTransfer -= stack.getAmount();
-                        hasInserted = true;
-                        break;
+                    if (FilterMatcher.canInsertFluid(this, provider, connection, simulatedExtract, filters) == isBlacklist) {
+                        connectionsFull[j] = true;
+                        continue;
+                    }
+                    IFluidHandler destination = connection.getFluidHandler();
+                    if (destination == null) {
+                        continue;
+                    }
+                    validHandlers[validTargets] = destination;
+                    validConnections[validTargets] = connection;
+                    validTargets++;
+                }
+                if (validTargets == 0) {
+                    scanned++;
+                    continue;
+                }
+                int totalAmount = simulatedExtract.getAmount();
+                int baseAmount = totalAmount / validTargets;
+                int remainder = totalAmount % validTargets;
+                int successfullyExtracted = 0;
+                int p = tileEntity.getRoundRobinIndex(side, this);
+                int startIndex = p % validTargets;
+                for (int j = 0; j < validTargets; j++) {
+                    int targetIndex = (startIndex + j) % validTargets;
+                    int amountToSend = baseAmount + (j < remainder ? 1 : 0);
+                    if (amountToSend <= 0) {
+                        continue;
+                    }
+                    FluidStack insertStack = amountToSend == totalAmount ? simulatedExtract : simulatedExtract.copyWithAmount(amountToSend);
+                    int canInsert = validHandlers[targetIndex].fill(insertStack, IFluidHandler.FluidAction.SIMULATE);
+                    if (canInsert > 0) {
+                        FluidStack actuallyExtracted = fluidHandler.drain(simulatedExtract.copyWithAmount(canInsert), IFluidHandler.FluidAction.EXECUTE);
+                        if (actuallyExtracted.isEmpty()) {
+                            continue;
+                        }
+                        validHandlers[targetIndex].fill(actuallyExtracted, IFluidHandler.FluidAction.EXECUTE);
+                        successfullyExtracted += actuallyExtracted.getAmount();
+                        tileEntity.markDestinationSuccessful(side, validConnections[targetIndex].getPos(), pipeIndex);
+                    } else {
+                        tileEntity.markDestinationPenalty(side, validConnections[targetIndex].getPos(), pipeIndex);
+                        for (int k = 0; k < targetCount; k++) {
+                            if (connections.get(k) == validConnections[targetIndex]) {
+                                connectionsFull[k] = true;
+                                break;
+                            }
+                        }
                     }
                 }
+                tileEntity.setRoundRobinIndex(side, this, (startIndex + remainder) % validTargets);
+                if (successfullyExtracted > 0) {
+                    mbToTransfer -= successfullyExtracted;
+                    madeProgressThisPass = true;
+                    tileEntity.setLastSlot(side, pipeIndex, currentTank);
+                }
+                scanned++;
             }
-            if (!hasInserted) {
-                connectionsFull[p] = true;
+            if (madeProgressThisPass && isCorrectionEnabled) {
+                continue;
             }
-            p = (p + 1) % connections.size();
+            keepTrying = false;
         }
-
-        tileEntity.setRoundRobinIndex(side, this, p);
+        if (mbToTransfer < initialTransfer) {
+            tileEntity.markExtractionSuccessful(side, pipeIndex);
+        } else {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
+        }
     }
 
     protected void insertOrdered(PipeLogicTileEntity tileEntity, Direction side, List<PipeTileEntity.Connection> connections, IFluidHandler fluidHandler) {
+        int pipeIndex = tileEntity.getIndex(this);
+        if (connections.isEmpty()) {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
+            return;
+        }
         int mbToTransfer = getRate(tileEntity, side);
-
+        if (mbToTransfer <= 0) {
+            return;
+        }
+        int initialTransfer = mbToTransfer;
+        int totalTanks = fluidHandler.getTanks();
+        if (totalTanks <= 0) {
+            return;
+        }
+        List<Filter<?, ?>> filters = tileEntity.getFilters(side, this);
+        boolean isBlacklist = tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST);
+        HolderLookup.Provider provider = tileEntity.getLevel().registryAccess();
+        boolean isCorrectionEnabled = tileEntity.isTransferCorrectionEnabled(side, pipeIndex);
+        boolean sleepEnabled = getMaxSleepTicks() > 0;
         connectionLoop:
         for (PipeTileEntity.Connection connection : connections) {
-            IFluidHandler destination = connection.getFluidHandler();
-            if (destination == null) {
+            if (sleepEnabled && !tileEntity.isDestinationAwake(side, connection.getPos(), pipeIndex)) {
                 continue;
             }
-
-            for (int i = 0; i < fluidHandler.getTanks(); i++) {
-                if (mbToTransfer <= 0) {
-                    break connectionLoop;
+            IFluidHandler destination = connection.getFluidHandler();
+            if (destination == null) {
+                tileEntity.markDestinationPenalty(side, connection.getPos(), pipeIndex);
+                continue;
+            }
+            boolean hasInsertedIntoDest = false;
+            boolean destRejected = false;
+            boolean keepTrying = true;
+            int loopCount = 0;
+            while (keepTrying && mbToTransfer > 0 && ++loopCount <= 1000) {
+                boolean madeProgressThisPass = false;
+                for (int i = 0; i < totalTanks; i++) {
+                    if (mbToTransfer <= 0) {
+                        break connectionLoop;
+                    }
+                    FluidStack simulatedExtract = simulateDrain(fluidHandler, i, mbToTransfer);
+                    if (simulatedExtract.isEmpty()) {
+                        continue;
+                    }
+                    if (FilterMatcher.canInsertFluid(this, provider, connection, simulatedExtract, filters) == isBlacklist) {
+                        destRejected = true;
+                        continue;
+                    }
+                    int canInsert = destination.fill(simulatedExtract, IFluidHandler.FluidAction.SIMULATE);
+                    if (canInsert > 0) {
+                        FluidStack actuallyExtracted = fluidHandler.drain(simulatedExtract.copyWithAmount(canInsert), IFluidHandler.FluidAction.EXECUTE);
+                        if (actuallyExtracted.isEmpty()) {
+                            continue;
+                        }
+                        destination.fill(actuallyExtracted, IFluidHandler.FluidAction.EXECUTE);
+                        mbToTransfer -= actuallyExtracted.getAmount();
+                        hasInsertedIntoDest = true;
+                        madeProgressThisPass = true;
+                        tileEntity.markDestinationSuccessful(side, connection.getPos(), pipeIndex);
+                    } else {
+                        destRejected = true;
+                    }
                 }
-                FluidStack fluidInTank = fluidHandler.getFluidInTank(i);
-                FluidStack copy = fluidInTank.copy();
-                copy.setAmount(mbToTransfer);
-                FluidStack simulatedExtract = fluidHandler.drain(copy, IFluidHandler.FluidAction.SIMULATE);
-                if (simulatedExtract.isEmpty()) {
+                if (madeProgressThisPass && isCorrectionEnabled) {
                     continue;
                 }
-                if (canInsert(tileEntity.getLevel().registryAccess(), connection, simulatedExtract, tileEntity.getFilters(side, this)) == tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST)) {
-                    continue;
-                }
-                FluidStack stack = FluidUtil.tryFluidTransfer(destination, fluidHandler, simulatedExtract, true);
-                mbToTransfer -= stack.getAmount();
+                keepTrying = false;
+            }
+            if (!hasInsertedIntoDest && destRejected) {
+                tileEntity.markDestinationPenalty(side, connection.getPos(), pipeIndex);
             }
         }
-    }
-
-    private boolean canInsert(HolderLookup.Provider provider, PipeTileEntity.Connection connection, FluidStack stack, List<Filter<?, ?>> filters) {
-        for (Filter<?, Fluid> filter : filters.stream().map(filter -> (Filter<?, Fluid>) filter).filter(Filter::isInvert).filter(f -> matchesConnection(connection, f)).collect(Collectors.toList())) {
-            if (matches(provider, filter, stack)) {
-                return false;
-            }
-        }
-        List<Filter<?, Fluid>> collect = filters.stream().map(filter -> (Filter<?, Fluid>) filter).filter(f -> !f.isInvert()).filter(f -> matchesConnection(connection, f)).collect(Collectors.toList());
-        if (collect.isEmpty()) {
-            return true;
-        }
-        for (Filter<?, Fluid> filter : collect) {
-            if (matches(provider, filter, stack)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean matches(HolderLookup.Provider provider, Filter<?, Fluid> filter, FluidStack stack) {
-        CompoundTag metadata = filter.getMetadata();
-        if (metadata == null) {
-            return filter.getTag() == null || filter.getTag().contains(stack.getFluid());
-        }
-        CompoundTag stackNBT = ComponentUtils.getTag(provider, stack);
-        if (filter.isExactMetadata()) {
-            if (deepExactCompare(metadata, stackNBT)) {
-                return filter.getTag() == null || filter.getTag().contains(stack.getFluid());
-            } else {
-                return false;
-            }
+        if (mbToTransfer < initialTransfer) {
+            tileEntity.markExtractionSuccessful(side, pipeIndex);
         } else {
-            if (stackNBT.isEmpty()) {
-                return metadata.size() <= 0;
-            }
-            if (!deepFuzzyCompare(metadata, stackNBT)) {
-                return false;
-            }
-            return filter.getTag() == null || filter.getTag().contains(stack.getFluid());
+            tileEntity.addExtractionPenalty(side, pipeIndex);
         }
     }
 
-    private boolean hasNotInserted(boolean[] inventoriesFull) {
-        for (boolean b : inventoriesFull) {
-            if (!b) {
-                return true;
+    /**
+     * 模拟抽取指定储罐，空罐时按任意流体回退
+     */
+    private FluidStack simulateDrain(IFluidHandler fluidHandler, int tank, int amount) {
+        FluidStack fluidInTank = fluidHandler.getFluidInTank(tank);
+        if (!fluidInTank.isEmpty()) {
+            FluidStack copy = fluidInTank.copy();
+            copy.setAmount(amount);
+            FluidStack simulated = fluidHandler.drain(copy, IFluidHandler.FluidAction.SIMULATE);
+            if (!simulated.isEmpty()) {
+                return simulated;
             }
         }
-        return false;
+        if (tank == 0) {
+            return fluidHandler.drain(amount, IFluidHandler.FluidAction.SIMULATE);
+        }
+        return FluidStack.EMPTY;
+    }
+
+    @Override
+    public boolean isCustomFrequencyEnabled() {
+        return Main.SERVER_CONFIG == null || Main.SERVER_CONFIG.enableFluidCustomFrequency.get();
+    }
+
+    @Override
+    public int getMaxSleepTicks() {
+        if (Main.SERVER_CONFIG == null) {
+            return 40;
+        }
+        return Main.SERVER_CONFIG.fluidMaxSleepTicks.get();
     }
 
     @Override

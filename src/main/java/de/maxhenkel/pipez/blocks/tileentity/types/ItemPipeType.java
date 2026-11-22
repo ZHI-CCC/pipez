@@ -8,11 +8,10 @@ import de.maxhenkel.pipez.blocks.tileentity.PipeTileEntity;
 import de.maxhenkel.pipez.blocks.tileentity.UpgradeTileEntity;
 import de.maxhenkel.pipez.datacomponents.ItemData;
 import de.maxhenkel.pipez.items.ModItems;
-import de.maxhenkel.pipez.utils.ComponentUtils;
+import de.maxhenkel.pipez.utils.FilterMatcher;
 import net.minecraft.core.Direction;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.core.component.DataComponentType;
-import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -23,13 +22,26 @@ import net.neoforged.neoforge.items.ItemHandlerHelper;
 
 import javax.annotation.Nullable;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.stream.Collectors;
 
 public class ItemPipeType extends PipeType<Item, ItemData> {
 
     public static final ItemPipeType INSTANCE = new ItemPipeType();
+
+    /**
+     * 可复用的目标处理器缓冲
+     */
+    private static final ThreadLocal<IItemHandler[]> HANDLER_BUFFER = ThreadLocal.withInitial(() -> new IItemHandler[128]);
+    /**
+     * 可复用的目标连接缓冲
+     */
+    private static final ThreadLocal<PipeTileEntity.Connection[]> CONNECTION_BUFFER = ThreadLocal.withInitial(() -> new PipeTileEntity.Connection[128]);
+    /**
+     * 可复用的目标掩码缓冲
+     */
+    private static final ThreadLocal<boolean[]> MASK_BUFFER = ThreadLocal.withInitial(() -> new boolean[128]);
 
     @Override
     public BlockCapability<?, Direction> getCapability() {
@@ -52,6 +64,11 @@ public class ItemPipeType extends PipeType<Item, ItemData> {
     }
 
     @Override
+    public String getRateTranslationKey() {
+        return "tooltip.pipez.transfer_rate.item";
+    }
+
+    @Override
     public ItemStack getIcon() {
         return new ItemStack(ModBlocks.ITEM_PIPE.get());
     }
@@ -64,9 +81,6 @@ public class ItemPipeType extends PipeType<Item, ItemData> {
     @Override
     public void tick(PipeLogicTileEntity tileEntity) {
         for (Direction side : Direction.values()) {
-            if (tileEntity.getLevel().getGameTime() % getSpeed(tileEntity, side) != 0) {
-                continue;
-            }
             if (!tileEntity.isExtracting(side)) {
                 continue;
             }
@@ -93,81 +107,221 @@ public class ItemPipeType extends PipeType<Item, ItemData> {
     }
 
     protected void insertEqually(PipeLogicTileEntity tileEntity, Direction side, List<PipeTileEntity.Connection> connections, IItemHandler itemHandler) {
-        if (connections.isEmpty()) {
+        int pipeIndex = tileEntity.getIndex(this);
+        int targetCount = connections.size();
+        if (targetCount == 0) {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
             return;
         }
         int itemsToTransfer = getRate(tileEntity, side);
-        boolean[] inventoriesFull = new boolean[connections.size()];
-        int p = tileEntity.getRoundRobinIndex(side, this) % connections.size();
-        while (itemsToTransfer > 0 && hasNotInserted(inventoriesFull)) {
-            PipeTileEntity.Connection connection = connections.get(p);
+        if (itemsToTransfer <= 0) {
+            return;
+        }
+        int initialTransfer = itemsToTransfer;
+        int totalSlots = itemHandler.getSlots();
+        if (totalSlots <= 0) {
+            return;
+        }
+        boolean[] fallbackMask = MASK_BUFFER.get();
+        if (fallbackMask.length < targetCount) {
+            fallbackMask = new boolean[targetCount];
+            MASK_BUFFER.set(fallbackMask);
+        }
+        Arrays.fill(fallbackMask, 0, targetCount, false);
+        boolean sleepEnabled = getMaxSleepTicks() > 0;
+        int validDestCount = 0;
+        for (int i = 0; i < targetCount; i++) {
+            PipeTileEntity.Connection connection = connections.get(i);
+            if (sleepEnabled && !tileEntity.isDestinationAwake(side, connection.getPos(), pipeIndex)) {
+                fallbackMask[i] = true;
+                continue;
+            }
             IItemHandler destination = connection.getItemHandler();
-            boolean hasInserted = false;
-            if (destination != null && !inventoriesFull[p] && !isFull(destination)) {
-                for (int j = 0; j < itemHandler.getSlots(); j++) {
-                    ItemStack simulatedExtract = itemHandler.extractItem(j, 1, true);
-                    if (simulatedExtract.isEmpty()) {
+            if (destination == null || isFull(destination)) {
+                fallbackMask[i] = true;
+                continue;
+            }
+            validDestCount++;
+        }
+        if (validDestCount == 0) {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
+            return;
+        }
+        List<Filter<?, ?>> filters = tileEntity.getFilters(side, this);
+        boolean isBlacklist = tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST);
+        HolderLookup.Provider provider = tileEntity.getLevel().registryAccess();
+        boolean isCorrectionEnabled = tileEntity.isTransferCorrectionEnabled(side, pipeIndex);
+        IItemHandler[] validHandlers = HANDLER_BUFFER.get();
+        if (validHandlers.length < targetCount) {
+            validHandlers = new IItemHandler[targetCount];
+            HANDLER_BUFFER.set(validHandlers);
+        }
+        PipeTileEntity.Connection[] validConnections = CONNECTION_BUFFER.get();
+        if (validConnections.length < targetCount) {
+            validConnections = new PipeTileEntity.Connection[targetCount];
+            CONNECTION_BUFFER.set(validConnections);
+        }
+        int startSlot = tileEntity.getLastSlot(side, pipeIndex) % totalSlots;
+        boolean keepTrying = true;
+        int loopCount = 0;
+        while (keepTrying && itemsToTransfer > 0 && ++loopCount <= 1000) {
+            boolean madeProgressThisPass = false;
+            int scanned = 0;
+            while (scanned < totalSlots && itemsToTransfer > 0) {
+                int currentSlot = (startSlot + scanned) % totalSlots;
+                ItemStack simulatedExtract = itemHandler.extractItem(currentSlot, itemsToTransfer, true);
+                if (simulatedExtract.isEmpty()) {
+                    scanned++;
+                    continue;
+                }
+                int validTargets = 0;
+                for (int j = 0; j < targetCount; j++) {
+                    if (fallbackMask[j]) {
                         continue;
                     }
-                    if (canInsert(tileEntity.getLevel().registryAccess(), connection, simulatedExtract, tileEntity.getFilters(side, this)) == tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST)) {
+                    PipeTileEntity.Connection connection = connections.get(j);
+                    if (FilterMatcher.canInsertItem(this, provider, connection, simulatedExtract, filters) == isBlacklist) {
                         continue;
                     }
-                    ItemStack stack = ItemHandlerHelper.insertItem(destination, simulatedExtract, false);
-                    int insertedAmount = simulatedExtract.getCount() - stack.getCount();
-                    if (insertedAmount > 0) {
-                        itemsToTransfer -= insertedAmount;
-                        itemHandler.extractItem(j, insertedAmount, false);
-                        hasInserted = true;
-                        break;
+                    validHandlers[validTargets] = connection.getItemHandler();
+                    validConnections[validTargets] = connection;
+                    validTargets++;
+                }
+                if (validTargets == 0) {
+                    scanned++;
+                    continue;
+                }
+                int totalAmount = simulatedExtract.getCount();
+                int baseAmount = totalAmount / validTargets;
+                int remainder = totalAmount % validTargets;
+                int successfullyExtracted = 0;
+                int p = tileEntity.getRoundRobinIndex(side, this);
+                int startIndex = p % validTargets;
+                for (int j = 0; j < validTargets; j++) {
+                    int targetIndex = (startIndex + j) % validTargets;
+                    int amountToSend = baseAmount + (j < remainder ? 1 : 0);
+                    if (amountToSend <= 0) {
+                        continue;
+                    }
+                    ItemStack insertStack = amountToSend == totalAmount ? simulatedExtract : simulatedExtract.copyWithCount(amountToSend);
+                    ItemStack notInsertedSim = ItemHandlerHelper.insertItem(validHandlers[targetIndex], insertStack, true);
+                    int canInsert = amountToSend - notInsertedSim.getCount();
+                    if (canInsert > 0) {
+                        ItemStack actuallyExtracted = itemHandler.extractItem(currentSlot, canInsert, false);
+                        if (actuallyExtracted.isEmpty()) {
+                            continue;
+                        }
+                        ItemHandlerHelper.insertItem(validHandlers[targetIndex], actuallyExtracted, false);
+                        successfullyExtracted += actuallyExtracted.getCount();
+                        tileEntity.markDestinationSuccessful(side, validConnections[targetIndex].getPos(), pipeIndex);
+                    } else {
+                        tileEntity.markDestinationPenalty(side, validConnections[targetIndex].getPos(), pipeIndex);
                     }
                 }
+                tileEntity.setRoundRobinIndex(side, this, (startIndex + remainder) % validTargets);
+                if (successfullyExtracted > 0) {
+                    itemsToTransfer -= successfullyExtracted;
+                    madeProgressThisPass = true;
+                    tileEntity.setLastSlot(side, pipeIndex, currentSlot);
+                }
+                scanned++;
             }
-            if (!hasInserted) {
-                inventoriesFull[p] = true;
+            if (madeProgressThisPass && isCorrectionEnabled) {
+                continue;
             }
-            p = (p + 1) % connections.size();
+            keepTrying = false;
         }
-
-        tileEntity.setRoundRobinIndex(side, this, p);
+        if (itemsToTransfer < initialTransfer) {
+            tileEntity.markExtractionSuccessful(side, pipeIndex);
+        } else {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
+        }
     }
 
     protected void insertOrdered(PipeLogicTileEntity tileEntity, Direction side, List<PipeTileEntity.Connection> connections, IItemHandler itemHandler) {
+        int pipeIndex = tileEntity.getIndex(this);
+        if (connections.isEmpty()) {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
+            return;
+        }
         int itemsToTransfer = getRate(tileEntity, side);
-
+        if (itemsToTransfer <= 0) {
+            return;
+        }
+        int initialTransfer = itemsToTransfer;
+        int totalSlots = itemHandler.getSlots();
+        if (totalSlots <= 0) {
+            return;
+        }
         ArrayList<ItemStack> nonFittingItems = new ArrayList<>();
-
+        List<Filter<?, ?>> filters = tileEntity.getFilters(side, this);
+        boolean isBlacklist = tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST);
+        HolderLookup.Provider provider = tileEntity.getLevel().registryAccess();
+        boolean isCorrectionEnabled = tileEntity.isTransferCorrectionEnabled(side, pipeIndex);
+        boolean sleepEnabled = getMaxSleepTicks() > 0;
         connectionLoop:
         for (PipeTileEntity.Connection connection : connections) {
+            if (sleepEnabled && !tileEntity.isDestinationAwake(side, connection.getPos(), pipeIndex)) {
+                continue;
+            }
             nonFittingItems.clear();
             IItemHandler destination = connection.getItemHandler();
-            if (destination == null) {
+            if (destination == null || isFull(destination)) {
+                tileEntity.markDestinationPenalty(side, connection.getPos(), pipeIndex);
                 continue;
             }
-            if (isFull(destination)) {
-                continue;
+            boolean hasInsertedIntoDest = false;
+            boolean keepTrying = true;
+            int loopCount = 0;
+            while (keepTrying && itemsToTransfer > 0 && ++loopCount <= 1000) {
+                boolean madeProgressThisPass = false;
+                for (int i = 0; i < totalSlots; i++) {
+                    if (itemsToTransfer <= 0) {
+                        break connectionLoop;
+                    }
+                    ItemStack simulatedExtract = itemHandler.extractItem(i, itemsToTransfer, true);
+                    if (simulatedExtract.isEmpty()) {
+                        continue;
+                    }
+                    boolean nonFitting = false;
+                    for (ItemStack stack : nonFittingItems) {
+                        if (ItemUtils.isStackable(stack, simulatedExtract)) {
+                            nonFitting = true;
+                            break;
+                        }
+                    }
+                    if (nonFitting || FilterMatcher.canInsertItem(this, provider, connection, simulatedExtract, filters) == isBlacklist) {
+                        continue;
+                    }
+                    ItemStack notInsertedSim = ItemHandlerHelper.insertItem(destination, simulatedExtract, true);
+                    int canInsert = simulatedExtract.getCount() - notInsertedSim.getCount();
+                    if (canInsert > 0) {
+                        ItemStack actuallyExtracted = itemHandler.extractItem(i, canInsert, false);
+                        if (actuallyExtracted.isEmpty()) {
+                            continue;
+                        }
+                        ItemHandlerHelper.insertItem(destination, actuallyExtracted, false);
+                        itemsToTransfer -= actuallyExtracted.getCount();
+                        hasInsertedIntoDest = true;
+                        madeProgressThisPass = true;
+                        tileEntity.markDestinationSuccessful(side, connection.getPos(), pipeIndex);
+                    } else {
+                        nonFittingItems.add(simulatedExtract);
+                    }
+                }
+                if (madeProgressThisPass && isCorrectionEnabled) {
+                    continue;
+                }
+                keepTrying = false;
             }
-            for (int i = 0; i < itemHandler.getSlots(); i++) {
-                if (itemsToTransfer <= 0) {
-                    break connectionLoop;
-                }
-                ItemStack simulatedExtract = itemHandler.extractItem(i, itemsToTransfer, true);
-                if (simulatedExtract.isEmpty()) {
-                    continue;
-                }
-                if (nonFittingItems.stream().anyMatch(stack -> ItemUtils.isStackable(stack, simulatedExtract))) {
-                    continue;
-                }
-                if (canInsert(tileEntity.getLevel().registryAccess(), connection, simulatedExtract, tileEntity.getFilters(side, this)) == tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST)) {
-                    continue;
-                }
-                ItemStack stack = ItemHandlerHelper.insertItem(destination, simulatedExtract, false);
-                int insertedAmount = simulatedExtract.getCount() - stack.getCount();
-                if (insertedAmount <= 0) {
-                    nonFittingItems.add(simulatedExtract);
-                }
-                itemsToTransfer -= insertedAmount;
-                itemHandler.extractItem(i, insertedAmount, false);
+            if (!hasInsertedIntoDest) {
+                tileEntity.markDestinationPenalty(side, connection.getPos(), pipeIndex);
             }
+        }
+        if (itemsToTransfer < initialTransfer) {
+            tileEntity.markExtractionSuccessful(side, pipeIndex);
+        } else {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
         }
     }
 
@@ -181,58 +335,22 @@ public class ItemPipeType extends PipeType<Item, ItemData> {
         return true;
     }
 
-    private boolean canInsert(HolderLookup.Provider provider, PipeTileEntity.Connection connection, ItemStack stack, List<Filter<?, ?>> filters) {
-        for (Filter<?, Item> filter : filters.stream().map(filter -> (Filter<?, Item>) filter).filter(Filter::isInvert).filter(f -> matchesConnection(connection, f)).collect(Collectors.toList())) {
-            if (matches(provider, filter, stack)) {
-                return false;
-            }
-        }
-        List<Filter<?, Item>> collect = filters.stream().map(filter -> (Filter<?, Item>) filter).filter(f -> !f.isInvert()).filter(f -> matchesConnection(connection, f)).collect(Collectors.toList());
-        if (collect.isEmpty()) {
-            return true;
-        }
-        for (Filter<?, Item> filter : collect) {
-            if (matches(provider, filter, stack)) {
-                return true;
-            }
-        }
-        return false;
+    @Override
+    public int getDefaultFrequency(@Nullable Upgrade upgrade) {
+        return getSpeed(upgrade);
     }
 
-    private boolean matches(HolderLookup.Provider provider, Filter<?, Item> filter, ItemStack stack) {
-        CompoundTag metadata = filter.getMetadata();
-        if (metadata == null) {
-            return filter.getTag() == null || filter.getTag().contains(stack.getItem());
-        }
-        CompoundTag stackNBT = ComponentUtils.getTag(provider, stack);
-        if (filter.isExactMetadata()) {
-            if (deepExactCompare(metadata, stackNBT)) {
-                return filter.getTag() == null || filter.getTag().contains(stack.getItem());
-            } else {
-                return false;
-            }
-        } else {
-            if (stackNBT.isEmpty()) {
-                return metadata.size() <= 0;
-            }
-            if (!deepFuzzyCompare(metadata, stackNBT)) {
-                return false;
-            }
-            return filter.getTag() == null || filter.getTag().contains(stack.getItem());
-        }
+    @Override
+    public boolean isCustomFrequencyEnabled() {
+        return Main.SERVER_CONFIG == null || Main.SERVER_CONFIG.enableItemCustomFrequency.get();
     }
 
-    private boolean hasNotInserted(boolean[] inventoriesFull) {
-        for (boolean b : inventoriesFull) {
-            if (!b) {
-                return true;
-            }
+    @Override
+    public int getMaxSleepTicks() {
+        if (Main.SERVER_CONFIG == null) {
+            return 40;
         }
-        return false;
-    }
-
-    public int getSpeed(PipeLogicTileEntity tileEntity, Direction direction) {
-        return getSpeed(tileEntity.getUpgrade(direction));
+        return Main.SERVER_CONFIG.itemMaxSleepTicks.get();
     }
 
     public int getSpeed(@Nullable Upgrade upgrade) {

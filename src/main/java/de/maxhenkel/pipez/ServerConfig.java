@@ -34,6 +34,17 @@ public class ServerConfig extends ConfigBase {
     public final ModConfigSpec.IntValue gasPipeAmountAdvanced;
     public final ModConfigSpec.IntValue gasPipeAmountUltimate;
 
+    public final ModConfigSpec.BooleanValue enableItemCustomFrequency;
+    public final ModConfigSpec.BooleanValue enableFluidCustomFrequency;
+    public final ModConfigSpec.BooleanValue enableEnergyCustomFrequency;
+    public final ModConfigSpec.BooleanValue enableGasCustomFrequency;
+    public final ModConfigSpec.BooleanValue restrictFrequencyToNative;
+    public final ModConfigSpec.BooleanValue showSmartSleepToggle;
+    public final ModConfigSpec.IntValue itemMaxSleepTicks;
+    public final ModConfigSpec.IntValue fluidMaxSleepTicks;
+    public final ModConfigSpec.IntValue energyMaxSleepTicks;
+    public final ModConfigSpec.IntValue gasMaxSleepTicks;
+
     public ServerConfig(ModConfigSpec.Builder builder) {
         super(builder);
         itemPipeSpeed = builder
@@ -135,6 +146,46 @@ public class ServerConfig extends ConfigBase {
         gasPipeAmountUltimate = builder
                 .comment("The amount of mB transferred each tick", "Only available if Mekanism is installed")
                 .defineInRange("gas_pipe.amount.ultimate", 40000, 1, Integer.MAX_VALUE);
+
+        enableItemCustomFrequency = builder
+                .comment("是否允许自定义物品管道的抽取频率", "0 表示使用当前升级的原生频率，可设 1~200 tick")
+                .define("custom_frequency.item", true);
+
+        enableFluidCustomFrequency = builder
+                .comment("是否允许自定义流体管道的抽取频率", "0 表示使用原生频率，可设 1~200 tick")
+                .define("custom_frequency.fluid", true);
+
+        enableEnergyCustomFrequency = builder
+                .comment("是否允许自定义能量管道的抽取频率", "0 表示使用原生频率，可设 1~200 tick")
+                .define("custom_frequency.energy", true);
+
+        enableGasCustomFrequency = builder
+                .comment("是否允许自定义气体管道的抽取频率", "0 表示使用原生频率，可设 1~200 tick", "仅安装 Mekanism 时可用")
+                .define("custom_frequency.gas", true);
+
+        restrictFrequencyToNative = builder
+                .comment("限制自定义抽取频率不得低于当前升级的原生频率", "开启后低于下限的值会自动回退到原生频率")
+                .define("custom_frequency.restrict_to_native", true);
+
+        showSmartSleepToggle = builder
+                .comment("是否在管道 GUI 中显示智能休眠开关", "关闭后所有连接默认启用智能休眠")
+                .define("smart_sleep.show_toggle", true);
+
+        itemMaxSleepTicks = builder
+                .comment("物品管道空闲时单次休眠的最大 tick 数", "0 表示关闭该管道类型的休眠")
+                .defineInRange("smart_sleep.max_item_ticks", 40, 0, 1200);
+
+        fluidMaxSleepTicks = builder
+                .comment("流体管道空闲时单次休眠的最大 tick 数", "0 表示关闭该管道类型的休眠")
+                .defineInRange("smart_sleep.max_fluid_ticks", 40, 0, 1200);
+
+        energyMaxSleepTicks = builder
+                .comment("能量管道空闲时单次休眠的最大 tick 数", "0 表示关闭该管道类型的休眠", "建议保持较低数值以避免供电中断")
+                .defineInRange("smart_sleep.max_energy_ticks", 5, 0, 1200);
+
+        gasMaxSleepTicks = builder
+                .comment("气体管道空闲时单次休眠的最大 tick 数", "0 表示关闭该管道类型的休眠", "仅安装 Mekanism 时可用")
+                .defineInRange("smart_sleep.max_gas_ticks", 40, 0, 1200);
     }
 
 }

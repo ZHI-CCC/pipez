@@ -4,13 +4,21 @@ import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import de.maxhenkel.corelib.tag.SingleElementTag;
 import de.maxhenkel.corelib.tag.Tag;
+import de.maxhenkel.pipez.utils.FilterMatcher;
+import de.maxhenkel.pipez.utils.NbtCompare;
 import de.maxhenkel.pipez.utils.NbtUtils;
 import net.minecraft.core.UUIDUtil;
+import net.minecraft.core.component.DataComponentPatch;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtOps;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.ByteBufCodecs;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.item.ItemStack;
+import net.neoforged.neoforge.fluids.FluidStack;
+import net.neoforged.neoforge.server.ServerLifecycleHooks;
 
 import javax.annotation.Nullable;
 import java.lang.reflect.Constructor;
@@ -27,6 +35,14 @@ public abstract class Filter<F extends Filter<F, T>, T> {
     @Nullable
     protected DirectionalPosition destination;
     protected boolean invert;
+
+    private transient ItemStack itemMatchCacheKey = ItemStack.EMPTY;
+    private transient boolean itemMatchCacheResult;
+    private transient FluidStack fluidMatchCacheKey = FluidStack.EMPTY;
+    private transient boolean fluidMatchCacheResult;
+    private transient int exactPatchState = -1;
+    @Nullable
+    private transient DataComponentPatch exactPatch;
 
     public Filter(UUID id, @Nullable Tag<T> tag, @Nullable CompoundTag metadata, boolean exactMetadata, @Nullable DirectionalPosition destination, boolean invert) {
         this.id = id;
@@ -48,6 +64,7 @@ public abstract class Filter<F extends Filter<F, T>, T> {
 
     public void setTag(@Nullable Tag<T> tag) {
         this.tag = tag;
+        invalidateMatchCaches();
     }
 
     @Nullable
@@ -57,6 +74,7 @@ public abstract class Filter<F extends Filter<F, T>, T> {
 
     public void setMetadata(@Nullable CompoundTag metadata) {
         this.metadata = metadata;
+        invalidateMatchCaches();
     }
 
     @Nullable
@@ -66,6 +84,7 @@ public abstract class Filter<F extends Filter<F, T>, T> {
 
     public void setDestination(@Nullable DirectionalPosition destination) {
         this.destination = destination;
+        invalidateMatchCaches();
     }
 
     public boolean isInvert() {
@@ -74,6 +93,7 @@ public abstract class Filter<F extends Filter<F, T>, T> {
 
     public void setInvert(boolean invert) {
         this.invert = invert;
+        invalidateMatchCaches();
     }
 
     public boolean isExactMetadata() {
@@ -82,6 +102,85 @@ public abstract class Filter<F extends Filter<F, T>, T> {
 
     public void setExactMetadata(boolean exactMetadata) {
         this.exactMetadata = exactMetadata;
+        invalidateMatchCaches();
+    }
+
+    /**
+     * 上一次物品匹配是否命中缓存
+     */
+    public boolean hasItemMatchCache(ItemStack stack) {
+        return ItemStack.isSameItemSameComponents(itemMatchCacheKey, stack);
+    }
+
+    public boolean getItemMatchResult() {
+        return itemMatchCacheResult;
+    }
+
+    public void setItemMatchCache(ItemStack stack, boolean result) {
+        this.itemMatchCacheKey = stack.copyWithCount(1);
+        this.itemMatchCacheResult = result;
+    }
+
+    /**
+     * 上一次流体匹配是否命中缓存
+     */
+    public boolean hasFluidMatchCache(FluidStack stack) {
+        return FluidStack.isSameFluidSameComponents(fluidMatchCacheKey, stack);
+    }
+
+    public boolean getFluidMatchResult() {
+        return fluidMatchCacheResult;
+    }
+
+    public void setFluidMatchCache(FluidStack stack, boolean result) {
+        this.fluidMatchCacheKey = stack.copy();
+        this.fluidMatchCacheKey.setAmount(1);
+        this.fluidMatchCacheResult = result;
+    }
+
+    /**
+     * 获取精确匹配用的组件补丁，带往返校验缓存
+     */
+    @Nullable
+    public DataComponentPatch getExactPatch() {
+        if (!exactMetadata || metadata == null) {
+            return null;
+        }
+        if (exactPatchState == 0) {
+            return null;
+        }
+        if (exactPatchState == 1) {
+            return exactPatch;
+        }
+        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+        if (server == null) {
+            return null;
+        }
+        DataComponentPatch patch = FilterMatcher.decodePatch(server.registryAccess(), metadata);
+        if (patch == null) {
+            exactPatchState = 0;
+            return null;
+        }
+        CompoundTag reEncoded = FilterMatcher.encodePatch(server.registryAccess(), patch);
+        if (reEncoded == null || !NbtCompare.exactCompare(metadata, reEncoded)) {
+            exactPatchState = 0;
+            return null;
+        }
+        exactPatch = patch;
+        exactPatchState = 1;
+        return patch;
+    }
+
+    /**
+     * 过滤条件变化后清空匹配缓存
+     */
+    public void invalidateMatchCaches() {
+        itemMatchCacheKey = ItemStack.EMPTY;
+        itemMatchCacheResult = false;
+        fluidMatchCacheKey = FluidStack.EMPTY;
+        fluidMatchCacheResult = false;
+        exactPatchState = -1;
+        exactPatch = null;
     }
 
     public F copy() {

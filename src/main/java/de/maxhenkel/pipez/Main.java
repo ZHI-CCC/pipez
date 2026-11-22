@@ -74,6 +74,9 @@ public class Main {
         CommonRegistry.registerMessage(registrar, RemoveFilterMessage.class);
         CommonRegistry.registerMessage(registrar, EditFilterMessage.class);
         CommonRegistry.registerMessage(registrar, OpenExtractMessage.class);
+        CommonRegistry.registerMessage(registrar, SetFrequencyMessage.class);
+        CommonRegistry.registerMessage(registrar, ToggleTransferCorrectionMessage.class);
+        CommonRegistry.registerMessage(registrar, ToggleSmartSleepMessage.class);
     }
 
 }

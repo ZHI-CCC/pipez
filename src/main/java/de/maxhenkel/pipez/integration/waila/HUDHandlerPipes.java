@@ -5,6 +5,7 @@ import de.maxhenkel.pipez.blocks.PipeBlock;
 import de.maxhenkel.pipez.blocks.tileentity.PipeLogicTileEntity;
 import de.maxhenkel.pipez.blocks.tileentity.UpgradeTileEntity;
 import de.maxhenkel.pipez.blocks.tileentity.types.PipeType;
+import de.maxhenkel.pipez.utils.RateTooltip;
 import net.minecraft.core.Direction;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
@@ -66,9 +67,12 @@ public class HUDHandlerPipes implements IBlockComponentProvider, IServerDataProv
 
             List<Component> tooltips = new ArrayList<>();
             for (PipeType<?, ?> pipeType : pipeTile.getPipeTypes()) {
-                if (pipeTile.isEnabled(selectedSide, pipeType)) {
-                    tooltips.add(pipeType.getTransferText(pipeTile.getUpgrade(selectedSide)));
+                if (!pipeTile.isEnabled(selectedSide, pipeType)) {
+                    continue;
                 }
+                int frequency = pipeTile.getEffectiveFrequency(selectedSide, pipeTile.getIndex(pipeType));
+                long rate = pipeType.getRate(pipeTile, selectedSide);
+                tooltips.add(RateTooltip.format(pipeType.getRateTranslationKey(), RateTooltip.formatNumber(rate, false), frequency));
             }
             putTooltips(blockAccessor, compound, tooltips);
         }

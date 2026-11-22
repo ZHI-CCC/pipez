@@ -1,7 +1,5 @@
 package de.maxhenkel.pipez.blocks.tileentity.types;
 
-import de.maxhenkel.corelib.energy.EnergyUtils;
-import de.maxhenkel.corelib.helpers.Pair;
 import de.maxhenkel.pipez.Filter;
 import de.maxhenkel.pipez.Main;
 import de.maxhenkel.pipez.Upgrade;
@@ -47,6 +45,11 @@ public class EnergyPipeType extends PipeType<Void, EnergyData> {
     @Override
     public String getTranslationKey() {
         return "tooltip.pipez.energy";
+    }
+
+    @Override
+    public String getRateTranslationKey() {
+        return "tooltip.pipez.transfer_rate.energy";
     }
 
     @Override
@@ -109,139 +112,274 @@ public class EnergyPipeType extends PipeType<Void, EnergyData> {
     }
 
     protected void insertEqually(PipeLogicTileEntity tileEntity, Direction side, List<PipeTileEntity.Connection> connections, IEnergyStorage energyStorage) {
-        if (connections.isEmpty()) {
+        int pipeIndex = tileEntity.getIndex(this);
+        ArrayList<PipeTileEntity.Connection> awakeConnections = filterAwake(tileEntity, side, connections, pipeIndex);
+        if (awakeConnections.isEmpty()) {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
             return;
         }
-        int completeAmount = getRate(tileEntity, side);
-        int energyToTransfer = completeAmount;
-
-        int p = tileEntity.getRoundRobinIndex(side, this) % connections.size();
-
-        List<IEnergyStorage> destinations = new ArrayList<>(connections.size());
-        for (int i = 0; i < connections.size(); i++) {
-            int index = (i + p) % connections.size();
-
-            PipeTileEntity.Connection connection = connections.get(index);
+        int energyToTransfer = getRate(tileEntity, side);
+        if (energyToTransfer <= 0) {
+            return;
+        }
+        int simulatedExtract = energyStorage.extractEnergy(energyToTransfer, true);
+        if (simulatedExtract <= 0) {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
+            return;
+        }
+        int targetCount = awakeConnections.size();
+        IEnergyStorage[] validHandlers = new IEnergyStorage[targetCount];
+        PipeTileEntity.Connection[] validConnections = new PipeTileEntity.Connection[targetCount];
+        int validTargets = 0;
+        for (PipeTileEntity.Connection connection : awakeConnections) {
             IEnergyStorage destination = connection.getEnergyHandler();
-            if (destination != null && destination.canReceive() && destination.receiveEnergy(1, true) >= 1) {
-                destinations.add(destination);
+            if (destination == null || !destination.canReceive()) {
+                continue;
             }
+            validHandlers[validTargets] = destination;
+            validConnections[validTargets] = connection;
+            validTargets++;
         }
-
-        for (IEnergyStorage destination : destinations) {
-            int simulatedExtract = energyStorage.extractEnergy(Math.min(Math.max(completeAmount / destinations.size(), 1), energyToTransfer), true);
-            if (simulatedExtract > 0) {
-                int transferred = EnergyUtils.pushEnergy(energyStorage, destination, simulatedExtract);
-                if (transferred > 0) {
-                    energyToTransfer -= transferred;
+        if (validTargets == 0) {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
+            return;
+        }
+        int baseAmount = simulatedExtract / validTargets;
+        int remainder = simulatedExtract % validTargets;
+        int successfullyExtracted = 0;
+        int p = tileEntity.getRoundRobinIndex(side, this);
+        int startIndex = p % validTargets;
+        for (int j = 0; j < validTargets; j++) {
+            int targetIndex = (startIndex + j) % validTargets;
+            int amountToSend = baseAmount + (j < remainder ? 1 : 0);
+            if (amountToSend <= 0) {
+                continue;
+            }
+            int canInsert = validHandlers[targetIndex].receiveEnergy(amountToSend, true);
+            if (canInsert > 0) {
+                int actuallyExtracted = energyStorage.extractEnergy(canInsert, false);
+                if (actuallyExtracted > 0) {
+                    validHandlers[targetIndex].receiveEnergy(actuallyExtracted, false);
+                    successfullyExtracted += actuallyExtracted;
+                    tileEntity.markDestinationSuccessful(side, validConnections[targetIndex].getPos(), pipeIndex);
+                    continue;
                 }
-            }
-
-            p = (p + 1) % connections.size();
-
-            if (energyToTransfer <= 0) {
-                break;
+                tileEntity.markDestinationPenalty(side, validConnections[targetIndex].getPos(), pipeIndex);
+            } else {
+                tileEntity.markDestinationPenalty(side, validConnections[targetIndex].getPos(), pipeIndex);
             }
         }
-
-        tileEntity.setRoundRobinIndex(side, this, p);
+        tileEntity.setRoundRobinIndex(side, this, (startIndex + remainder) % validTargets);
+        if (successfullyExtracted > 0) {
+            tileEntity.markExtractionSuccessful(side, pipeIndex);
+        } else {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
+        }
     }
 
     protected int receiveEqually(PipeLogicTileEntity tileEntity, Direction side, List<PipeTileEntity.Connection> connections, int maxReceive, boolean simulate) {
+        int pipeIndex = tileEntity.getIndex(this);
         if (connections.isEmpty() || maxReceive <= 0) {
+            if (!simulate) {
+                tileEntity.addExtractionPenalty(side, pipeIndex);
+            }
             return 0;
         }
         if (tileEntity.pushRecursion()) {
             return 0;
         }
-        int actuallyTransferred = 0;
-        int energyToTransfer = maxReceive;
-        int p = tileEntity.getRoundRobinIndex(side, this) % connections.size();
-
-        List<Pair<IEnergyStorage, Integer>> destinations = new ArrayList<>(connections.size());
-        for (int i = 0; i < connections.size(); i++) {
-            int index = (i + p) % connections.size();
-
-            PipeTileEntity.Connection connection = connections.get(index);
+        boolean sleepEnabled = getMaxSleepTicks() > 0;
+        int targetCount = connections.size();
+        IEnergyStorage[] validHandlers = new IEnergyStorage[targetCount];
+        PipeTileEntity.Connection[] validConnections = new PipeTileEntity.Connection[targetCount];
+        int validTargets = 0;
+        for (int i = 0; i < targetCount; i++) {
+            PipeTileEntity.Connection connection = connections.get(i);
+            if (sleepEnabled && !tileEntity.isDestinationAwake(side, connection.getPos(), pipeIndex)) {
+                continue;
+            }
             IEnergyStorage destination = connection.getEnergyHandler();
-            // destination.receiveEnergy(1, true) doesn't work for Mekanism machines, so we try to insert the maximum amount
-            if (destination != null && destination.canReceive() && destination.receiveEnergy(maxReceive, true) >= 1) {
-                destinations.add(new Pair<>(destination, index));
+            if (destination == null || !destination.canReceive() || destination.receiveEnergy(maxReceive, true) <= 0) {
+                continue;
             }
+            validHandlers[validTargets] = destination;
+            validConnections[validTargets] = connection;
+            validTargets++;
         }
-
-        for (Pair<IEnergyStorage, Integer> destination : destinations) {
-            int maxTransfer = Math.min(Math.max(maxReceive / destinations.size(), 1), energyToTransfer);
-            int extracted = destination.getKey().receiveEnergy(Math.min(maxTransfer, maxReceive), simulate);
-            if (extracted > 0) {
-                energyToTransfer -= extracted;
-                actuallyTransferred += extracted;
+        if (validTargets == 0) {
+            tileEntity.popRecursion();
+            if (!simulate) {
+                tileEntity.addExtractionPenalty(side, pipeIndex);
             }
-
-            p = destination.getValue() + 1;
-
-            if (energyToTransfer <= 0) {
-                break;
-            }
+            return 0;
         }
-
-        if (!simulate) {
-            tileEntity.setRoundRobinIndex(side, this, p);
+        int actuallyTransferred = 0;
+        int baseAmount = maxReceive / validTargets;
+        int remainder = maxReceive % validTargets;
+        int p = tileEntity.getRoundRobinIndex(side, this);
+        int startIndex = p % validTargets;
+        for (int i = 0; i < validTargets; i++) {
+            int targetIndex = (startIndex + i) % validTargets;
+            int amountToSend = baseAmount + (i < remainder ? 1 : 0);
+            if (amountToSend <= 0) {
+                continue;
+            }
+            int received = validHandlers[targetIndex].receiveEnergy(amountToSend, simulate);
+            actuallyTransferred += received;
+            if (simulate) {
+                continue;
+            }
+            if (received > 0) {
+                tileEntity.markDestinationSuccessful(side, validConnections[targetIndex].getPos(), pipeIndex);
+            } else {
+                tileEntity.markDestinationPenalty(side, validConnections[targetIndex].getPos(), pipeIndex);
+            }
         }
         tileEntity.popRecursion();
+        if (!simulate) {
+            tileEntity.setRoundRobinIndex(side, this, (startIndex + remainder) % validTargets);
+            if (actuallyTransferred > 0) {
+                tileEntity.markExtractionSuccessful(side, pipeIndex);
+            } else {
+                tileEntity.addExtractionPenalty(side, pipeIndex);
+            }
+        }
         return actuallyTransferred;
     }
 
     protected void insertOrdered(PipeLogicTileEntity tileEntity, Direction side, List<PipeTileEntity.Connection> connections, IEnergyStorage energyStorage) {
+        int pipeIndex = tileEntity.getIndex(this);
+        ArrayList<PipeTileEntity.Connection> awakeConnections = filterAwake(tileEntity, side, connections, pipeIndex);
+        if (awakeConnections.isEmpty()) {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
+            return;
+        }
         int energyToTransfer = getRate(tileEntity, side);
-
-        for (PipeTileEntity.Connection connection : connections) {
-            if (energyToTransfer <= 0) {
+        if (energyToTransfer <= 0) {
+            return;
+        }
+        int simulatedExtract = energyStorage.extractEnergy(energyToTransfer, true);
+        if (simulatedExtract <= 0) {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
+            return;
+        }
+        boolean hasInsertedAny = false;
+        int remainingToInsert = simulatedExtract;
+        for (PipeTileEntity.Connection connection : awakeConnections) {
+            if (remainingToInsert <= 0) {
                 break;
             }
             IEnergyStorage destination = connection.getEnergyHandler();
             if (destination == null || !destination.canReceive()) {
+                tileEntity.markDestinationPenalty(side, connection.getPos(), pipeIndex);
                 continue;
             }
-
-            int simulatedExtract = energyStorage.extractEnergy(energyToTransfer, true);
-            if (simulatedExtract > 0) {
-                int extract = EnergyUtils.pushEnergy(energyStorage, destination, simulatedExtract);
-                energyToTransfer -= extract;
+            int canInsert = destination.receiveEnergy(remainingToInsert, true);
+            if (canInsert > 0) {
+                int actuallyExtracted = energyStorage.extractEnergy(canInsert, false);
+                if (actuallyExtracted > 0) {
+                    destination.receiveEnergy(actuallyExtracted, false);
+                    remainingToInsert -= actuallyExtracted;
+                    hasInsertedAny = true;
+                    tileEntity.markDestinationSuccessful(side, connection.getPos(), pipeIndex);
+                    continue;
+                }
+                tileEntity.markDestinationPenalty(side, connection.getPos(), pipeIndex);
+            } else {
+                tileEntity.markDestinationPenalty(side, connection.getPos(), pipeIndex);
             }
+        }
+        if (hasInsertedAny) {
+            tileEntity.markExtractionSuccessful(side, pipeIndex);
+        } else {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
         }
     }
 
     protected int receiveOrdered(PipeLogicTileEntity tileEntity, Direction side, List<PipeTileEntity.Connection> connections, int maxReceive, boolean simulate) {
+        int pipeIndex = tileEntity.getIndex(this);
+        if (connections.isEmpty() || maxReceive <= 0) {
+            if (!simulate) {
+                tileEntity.addExtractionPenalty(side, pipeIndex);
+            }
+            return 0;
+        }
         if (tileEntity.pushRecursion()) {
             return 0;
         }
+        boolean sleepEnabled = getMaxSleepTicks() > 0;
         int actuallyTransferred = 0;
         int energyToTransfer = maxReceive;
-
         for (PipeTileEntity.Connection connection : connections) {
             if (energyToTransfer <= 0) {
                 break;
             }
-            IEnergyStorage destination = connection.getEnergyHandler();
-            if (destination == null || !destination.canReceive()) {
+            if (sleepEnabled && !tileEntity.isDestinationAwake(side, connection.getPos(), pipeIndex)) {
                 continue;
             }
-
+            IEnergyStorage destination = connection.getEnergyHandler();
+            if (destination == null || !destination.canReceive()) {
+                if (simulate) {
+                    continue;
+                }
+                tileEntity.markDestinationPenalty(side, connection.getPos(), pipeIndex);
+                continue;
+            }
             int extracted = destination.receiveEnergy(Math.min(energyToTransfer, maxReceive), simulate);
-            energyToTransfer -= extracted;
-            actuallyTransferred += extracted;
+            if (extracted > 0) {
+                energyToTransfer -= extracted;
+                actuallyTransferred += extracted;
+                if (simulate) {
+                    continue;
+                }
+                tileEntity.markDestinationSuccessful(side, connection.getPos(), pipeIndex);
+            } else if (!simulate) {
+                tileEntity.markDestinationPenalty(side, connection.getPos(), pipeIndex);
+            }
         }
         tileEntity.popRecursion();
+        if (!simulate) {
+            if (actuallyTransferred > 0) {
+                tileEntity.markExtractionSuccessful(side, pipeIndex);
+            } else {
+                tileEntity.addExtractionPenalty(side, pipeIndex);
+            }
+        }
         return actuallyTransferred;
     }
 
-    private boolean hasNotInserted(boolean[] inventoriesFull) {
-        for (boolean b : inventoriesFull) {
-            if (!b) {
-                return true;
+    /**
+     * 过滤出当前处于唤醒状态的连接
+     */
+    private ArrayList<PipeTileEntity.Connection> filterAwake(PipeLogicTileEntity tileEntity, Direction side, List<PipeTileEntity.Connection> connections, int pipeIndex) {
+        ArrayList<PipeTileEntity.Connection> awakeConnections = new ArrayList<>(connections.size());
+        if (getMaxSleepTicks() <= 0) {
+            awakeConnections.addAll(connections);
+            return awakeConnections;
+        }
+        for (PipeTileEntity.Connection connection : connections) {
+            if (tileEntity.isDestinationAwake(side, connection.getPos(), pipeIndex)) {
+                awakeConnections.add(connection);
             }
         }
+        return awakeConnections;
+    }
+
+    @Override
+    public boolean isCustomFrequencyEnabled() {
+        return Main.SERVER_CONFIG == null || Main.SERVER_CONFIG.enableEnergyCustomFrequency.get();
+    }
+
+    @Override
+    public int getMaxSleepTicks() {
+        if (Main.SERVER_CONFIG == null) {
+            return 5;
+        }
+        return Main.SERVER_CONFIG.energyMaxSleepTicks.get();
+    }
+
+    @Override
+    public boolean supportsTransferCorrection() {
         return false;
     }
 

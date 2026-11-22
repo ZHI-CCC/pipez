@@ -11,6 +11,7 @@ import de.maxhenkel.pipez.blocks.tileentity.UpgradeTileEntity;
 import de.maxhenkel.pipez.capabilities.ModCapabilities;
 import de.maxhenkel.pipez.datacomponents.GasData;
 import de.maxhenkel.pipez.items.ModItems;
+import de.maxhenkel.pipez.utils.FilterMatcher;
 import de.maxhenkel.pipez.utils.MekanismUtils;
 import mekanism.api.Action;
 import mekanism.api.chemical.Chemical;
@@ -25,7 +26,6 @@ import net.neoforged.neoforge.capabilities.BlockCapability;
 import javax.annotation.Nullable;
 import java.util.Collections;
 import java.util.List;
-import java.util.stream.Collectors;
 
 public class GasPipeType extends PipeType<Chemical, GasData> {
 
@@ -44,6 +44,11 @@ public class GasPipeType extends PipeType<Chemical, GasData> {
     @Override
     public String getTranslationKey() {
         return "tooltip.pipez.gas";
+    }
+
+    @Override
+    public String getRateTranslationKey() {
+        return "tooltip.pipez.transfer_rate.gas";
     }
 
     @Override
@@ -90,111 +95,226 @@ public class GasPipeType extends PipeType<Chemical, GasData> {
     }
 
     protected void insertEqually(PipeLogicTileEntity tileEntity, Direction side, List<PipeTileEntity.Connection> connections, IChemicalHandler gasHandler) {
-        if (connections.isEmpty()) {
+        int pipeIndex = tileEntity.getIndex(this);
+        int targetCount = connections.size();
+        if (targetCount == 0) {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
             return;
         }
         long completeAmount = getRate(tileEntity, side);
         long mbToTransfer = completeAmount;
-        boolean[] connectionsFull = new boolean[connections.size()];
-        int p = tileEntity.getRoundRobinIndex(side, this) % connections.size();
-        while (mbToTransfer > 0 && hasNotInserted(connectionsFull)) {
-            PipeTileEntity.Connection connection = connections.get(p);
-            IChemicalHandler destination = connection.getChemicalHandler();
-            boolean hasInserted = false;
-            if (destination != null && !connectionsFull[p]) {
-                for (int j = 0; j < gasHandler.getChemicalTanks(); j++) {
-                    ChemicalStack gasInTank = gasHandler.getChemicalInTank(j);
-                    ChemicalStack simulatedExtract = gasHandler.extractChemical(new ChemicalStack(gasInTank.getChemical(), Math.min(Math.max(completeAmount / getConnectionsNotFullCount(connectionsFull), 1), mbToTransfer)), Action.SIMULATE);
-                    if (simulatedExtract.isEmpty()) {
+        if (mbToTransfer <= 0L) {
+            return;
+        }
+        int totalTanks = gasHandler.getChemicalTanks();
+        if (totalTanks <= 0) {
+            return;
+        }
+        List<Filter<?, ?>> filters = tileEntity.getFilters(side, this);
+        boolean isBlacklist = tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST);
+        boolean isCorrectionEnabled = tileEntity.isTransferCorrectionEnabled(side, pipeIndex);
+        boolean[] connectionsFull = new boolean[targetCount];
+        IChemicalHandler[] validHandlers = new IChemicalHandler[targetCount];
+        PipeTileEntity.Connection[] validConnections = new PipeTileEntity.Connection[targetCount];
+        boolean sleepEnabled = getMaxSleepTicks() > 0;
+        int startTank = tileEntity.getLastSlot(side, pipeIndex) % totalTanks;
+        boolean keepTrying = true;
+        int loopCount = 0;
+        while (keepTrying && mbToTransfer > 0L && ++loopCount <= 1000) {
+            boolean madeProgressThisPass = false;
+            int scanned = 0;
+            while (scanned < totalTanks && mbToTransfer > 0L) {
+                int currentTank = (startTank + scanned) % totalTanks;
+                ChemicalStack simulatedExtract = simulateExtract(gasHandler, currentTank, mbToTransfer);
+                if (simulatedExtract.isEmpty()) {
+                    scanned++;
+                    continue;
+                }
+                int validTargets = 0;
+                for (int j = 0; j < targetCount; j++) {
+                    if (connectionsFull[j]) {
                         continue;
                     }
-                    if (canInsert(connection, simulatedExtract, tileEntity.getFilters(side, this)) == tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST)) {
+                    PipeTileEntity.Connection connection = connections.get(j);
+                    if (sleepEnabled && !tileEntity.isDestinationAwake(side, connection.getPos(), pipeIndex)) {
                         continue;
                     }
-                    ChemicalStack stack = transfer(gasHandler, destination, simulatedExtract);
-                    if (stack.getAmount() > 0) {
-                        mbToTransfer -= stack.getAmount();
-                        hasInserted = true;
-                        break;
+                    if (FilterMatcher.canInsertGas(this, connection, simulatedExtract, filters) == isBlacklist) {
+                        connectionsFull[j] = true;
+                        continue;
+                    }
+                    IChemicalHandler destination = connection.getChemicalHandler();
+                    if (destination == null) {
+                        continue;
+                    }
+                    validHandlers[validTargets] = destination;
+                    validConnections[validTargets] = connection;
+                    validTargets++;
+                }
+                if (validTargets == 0) {
+                    scanned++;
+                    continue;
+                }
+                long totalAmount = simulatedExtract.getAmount();
+                long baseAmount = totalAmount / validTargets;
+                long remainder = totalAmount % validTargets;
+                long successfullyExtracted = 0L;
+                int p = tileEntity.getRoundRobinIndex(side, this);
+                int startIndex = p % validTargets;
+                for (int j = 0; j < validTargets; j++) {
+                    int targetIndex = (startIndex + j) % validTargets;
+                    long amountToSend = baseAmount + (j < remainder ? 1 : 0);
+                    if (amountToSend <= 0L) {
+                        continue;
+                    }
+                    ChemicalStack insertStack = amountToSend == totalAmount ? simulatedExtract : new ChemicalStack(simulatedExtract.getChemical(), amountToSend);
+                    ChemicalStack leftOverSim = validHandlers[targetIndex].insertChemical(insertStack, Action.SIMULATE);
+                    long canInsert = amountToSend - leftOverSim.getAmount();
+                    if (canInsert > 0L) {
+                        ChemicalStack actuallyExtracted = gasHandler.extractChemical(new ChemicalStack(simulatedExtract.getChemical(), canInsert), Action.EXECUTE);
+                        if (actuallyExtracted.isEmpty()) {
+                            continue;
+                        }
+                        validHandlers[targetIndex].insertChemical(actuallyExtracted, Action.EXECUTE);
+                        successfullyExtracted += actuallyExtracted.getAmount();
+                        tileEntity.markDestinationSuccessful(side, validConnections[targetIndex].getPos(), pipeIndex);
+                    } else {
+                        tileEntity.markDestinationPenalty(side, validConnections[targetIndex].getPos(), pipeIndex);
+                        for (int k = 0; k < targetCount; k++) {
+                            if (connections.get(k) == validConnections[targetIndex]) {
+                                connectionsFull[k] = true;
+                                break;
+                            }
+                        }
                     }
                 }
+                tileEntity.setRoundRobinIndex(side, this, (startIndex + (int) remainder) % validTargets);
+                if (successfullyExtracted > 0L) {
+                    mbToTransfer -= successfullyExtracted;
+                    madeProgressThisPass = true;
+                    tileEntity.setLastSlot(side, pipeIndex, currentTank);
+                }
+                scanned++;
             }
-            if (!hasInserted) {
-                connectionsFull[p] = true;
+            if (madeProgressThisPass && isCorrectionEnabled) {
+                continue;
             }
-            p = (p + 1) % connections.size();
+            keepTrying = false;
         }
-
-        tileEntity.setRoundRobinIndex(side, this, p);
+        if (mbToTransfer < completeAmount) {
+            tileEntity.markExtractionSuccessful(side, pipeIndex);
+        } else {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
+        }
     }
 
     protected void insertOrdered(PipeLogicTileEntity tileEntity, Direction side, List<PipeTileEntity.Connection> connections, IChemicalHandler gasHandler) {
+        int pipeIndex = tileEntity.getIndex(this);
+        if (connections.isEmpty()) {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
+            return;
+        }
         long mbToTransfer = getRate(tileEntity, side);
-
+        if (mbToTransfer <= 0L) {
+            return;
+        }
+        long initialTransfer = mbToTransfer;
+        int totalTanks = gasHandler.getChemicalTanks();
+        if (totalTanks <= 0) {
+            return;
+        }
+        List<Filter<?, ?>> filters = tileEntity.getFilters(side, this);
+        boolean isBlacklist = tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST);
+        boolean isCorrectionEnabled = tileEntity.isTransferCorrectionEnabled(side, pipeIndex);
+        boolean sleepEnabled = getMaxSleepTicks() > 0;
         connectionLoop:
         for (PipeTileEntity.Connection connection : connections) {
-            IChemicalHandler destination = connection.getChemicalHandler();
-            if (destination == null) {
+            if (sleepEnabled && !tileEntity.isDestinationAwake(side, connection.getPos(), pipeIndex)) {
                 continue;
             }
-
-            for (int i = 0; i < gasHandler.getChemicalTanks(); i++) {
-                if (mbToTransfer <= 0) {
-                    break connectionLoop;
+            IChemicalHandler destination = connection.getChemicalHandler();
+            if (destination == null) {
+                tileEntity.markDestinationPenalty(side, connection.getPos(), pipeIndex);
+                continue;
+            }
+            boolean hasInsertedIntoDest = false;
+            boolean destRejected = false;
+            boolean keepTrying = true;
+            int loopCount = 0;
+            while (keepTrying && mbToTransfer > 0L && ++loopCount <= 1000) {
+                boolean madeProgressThisPass = false;
+                for (int i = 0; i < totalTanks; i++) {
+                    if (mbToTransfer <= 0L) {
+                        break connectionLoop;
+                    }
+                    ChemicalStack simulatedExtract = simulateExtract(gasHandler, i, mbToTransfer);
+                    if (simulatedExtract.isEmpty()) {
+                        continue;
+                    }
+                    if (FilterMatcher.canInsertGas(this, connection, simulatedExtract, filters) == isBlacklist) {
+                        destRejected = true;
+                        continue;
+                    }
+                    ChemicalStack leftOverSim = destination.insertChemical(simulatedExtract, Action.SIMULATE);
+                    long canInsert = simulatedExtract.getAmount() - leftOverSim.getAmount();
+                    if (canInsert > 0L) {
+                        ChemicalStack actuallyExtracted = gasHandler.extractChemical(new ChemicalStack(simulatedExtract.getChemical(), canInsert), Action.EXECUTE);
+                        if (actuallyExtracted.isEmpty()) {
+                            continue;
+                        }
+                        destination.insertChemical(actuallyExtracted, Action.EXECUTE);
+                        mbToTransfer -= actuallyExtracted.getAmount();
+                        hasInsertedIntoDest = true;
+                        madeProgressThisPass = true;
+                        tileEntity.markDestinationSuccessful(side, connection.getPos(), pipeIndex);
+                    } else {
+                        destRejected = true;
+                    }
                 }
-                ChemicalStack gasInTank = gasHandler.getChemicalInTank(i);
-                ChemicalStack simulatedExtract = gasHandler.extractChemical(new ChemicalStack(gasInTank.getChemical(), mbToTransfer), Action.SIMULATE);
-                if (simulatedExtract.isEmpty()) {
+                if (madeProgressThisPass && isCorrectionEnabled) {
                     continue;
                 }
-                if (canInsert(connection, simulatedExtract, tileEntity.getFilters(side, this)) == tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST)) {
-                    continue;
-                }
-                ChemicalStack stack = transfer(gasHandler, destination, simulatedExtract);
-                mbToTransfer -= stack.getAmount();
+                keepTrying = false;
             }
+            if (!hasInsertedIntoDest && destRejected) {
+                tileEntity.markDestinationPenalty(side, connection.getPos(), pipeIndex);
+            }
+        }
+        if (mbToTransfer < initialTransfer) {
+            tileEntity.markExtractionSuccessful(side, pipeIndex);
+        } else {
+            tileEntity.addExtractionPenalty(side, pipeIndex);
         }
     }
 
-    private ChemicalStack transfer(IChemicalHandler source, IChemicalHandler destination, ChemicalStack transfer) {
-        ChemicalStack extracted = source.extractChemical(transfer, Action.SIMULATE);
-        ChemicalStack gasStack = destination.insertChemical(extracted, Action.EXECUTE);
-        long amount = extracted.getAmount() - gasStack.getAmount();
-        if (amount <= 0) {
-            return ChemicalStack.EMPTY;
-        }
-        return source.extractChemical(new ChemicalStack(extracted.getChemical(), amount), Action.EXECUTE);
-    }
-
-    private boolean canInsert(PipeTileEntity.Connection connection, ChemicalStack stack, List<Filter<?, ?>> filters) {
-        for (Filter<?, Chemical> filter : filters.stream().map(filter -> (Filter<?, Chemical>) filter).filter(Filter::isInvert).filter(f -> matchesConnection(connection, f)).collect(Collectors.toList())) {
-            if (matches(filter, stack)) {
-                return false;
+    /**
+     * 模拟抽取指定化学储罐，空罐时按任意化学品回退
+     */
+    private ChemicalStack simulateExtract(IChemicalHandler gasHandler, int tank, long amount) {
+        ChemicalStack gasInTank = gasHandler.getChemicalInTank(tank);
+        if (!gasInTank.isEmpty()) {
+            ChemicalStack simulated = gasHandler.extractChemical(new ChemicalStack(gasInTank.getChemical(), amount), Action.SIMULATE);
+            if (!simulated.isEmpty()) {
+                return simulated;
             }
         }
-        List<Filter<?, Chemical>> collect = filters.stream().map(filter -> (Filter<?, Chemical>) filter).filter(f -> !f.isInvert()).filter(f -> matchesConnection(connection, f)).collect(Collectors.toList());
-        if (collect.isEmpty()) {
-            return true;
+        if (tank == 0) {
+            return gasHandler.extractChemical(amount, Action.SIMULATE);
         }
-        for (Filter<?, Chemical> filter : collect) {
-            if (matches(filter, stack)) {
-                return true;
-            }
-        }
-        return false;
+        return ChemicalStack.EMPTY;
     }
 
-    private boolean matches(Filter<?, Chemical> filter, ChemicalStack stack) {
-        return filter.getTag() == null || filter.getTag().contains(stack.getChemical());
+    @Override
+    public boolean isCustomFrequencyEnabled() {
+        return Main.SERVER_CONFIG == null || Main.SERVER_CONFIG.enableGasCustomFrequency.get();
     }
 
-    private boolean hasNotInserted(boolean[] inventoriesFull) {
-        for (boolean b : inventoriesFull) {
-            if (!b) {
-                return true;
-            }
+    @Override
+    public int getMaxSleepTicks() {
+        if (Main.SERVER_CONFIG == null) {
+            return 40;
         }
-        return false;
+        return Main.SERVER_CONFIG.gasMaxSleepTicks.get();
     }
 
     @Override
